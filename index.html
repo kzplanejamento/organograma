@@ -8,7 +8,8 @@
   import { initializeApp } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-app.js";
   import { getAnalytics } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-analytics.js";
   import {
-    getFirestore, collection, addDoc, getDocs, getDoc, doc, query, orderBy, serverTimestamp
+    getFirestore, collection, addDoc, getDocs, getDoc, doc, query, orderBy, serverTimestamp,
+    updateDoc, onSnapshot
   } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-firestore.js";
 
   const firebaseConfig = {
@@ -58,8 +59,29 @@
     return { id: snap.id, name: data.name, state: data.state };
   }
 
+  // Autosave: atualiza o estado de um documento já existente (não cria versão nova)
+  async function updateOrganograma(id, state){
+    await updateDoc(doc(db, COLLECTION_NAME, id), {
+      state: state,
+      updatedAt: serverTimestamp()
+    });
+  }
+
+  // Tempo real: escuta mudanças no documento (feitas por outra pessoa/aba) e chama cb(data)
+  // Ignora o próprio "eco" da escrita local (hasPendingWrites) para não entrar em loop.
+  function watchOrganograma(id, cb){
+    const ref = doc(db, COLLECTION_NAME, id);
+    return onSnapshot(ref, { includeMetadataChanges: true }, function(snap){
+      if(snap.metadata.hasPendingWrites) return;
+      if(!snap.exists()) return;
+      cb(snap.data());
+    }, function(err){
+      console.error('Erro no listener em tempo real:', err);
+    });
+  }
+
   // Expõe as funções para o script principal (não-module) usar
-  window.__fb = { saveOrganograma, listOrganogramas, getOrganograma };
+  window.__fb = { saveOrganograma, listOrganogramas, getOrganograma, updateOrganograma, watchOrganograma };
 </script>
 
 <style>
@@ -284,8 +306,9 @@ body { font-family: Arial, sans-serif; background: #e8e8e8; color: #333; }
   <button class="tb" onclick="exportPNG()" style="background:#0891b2;color:#fff;border-color:#066a8c;">🖼 Imagem PNG</button>
   <button class="tb" onclick="saveHTML()" style="background:#d35400;color:#fff;border-color:#a84300;" title="Salva o HTML com todos os dados embutidos — pronto para compartilhar">🔗 Compartilhar HTML</button>
   <span class="sep"></span>
-  <button class="tb" style="background:#ff8f00;color:#fff;border-color:#c96a00;" onclick="openFbSave()" title="Salva uma nova versão na nuvem (Firebase)">☁ Salvar versão</button>
-  <button class="tb" style="background:#0277bd;color:#fff;border-color:#01579b;" onclick="openFbOpen()" title="Abre uma versão salva na nuvem (Firebase)">📂 Abrir versão</button>
+  <button class="tb" style="background:#ff8f00;color:#fff;border-color:#c96a00;" onclick="openFbSave()" title="Cria uma nova revisão nomeada no Firebase (ex: mensal). A partir dela, tudo salva sozinho e em tempo real.">☁ Salvar revisão</button>
+  <button class="tb" style="background:#0277bd;color:#fff;border-color:#01579b;" onclick="openFbOpen()" title="Lista as revisões salvas no Firebase para abrir">📂 Abrir revisão</button>
+  <span id="sync-status" style="font-size:11px;color:#999;white-space:nowrap;"></span>
   <span class="sep"></span>
   <div class="lclr-wrap">Linha: <input type="color" id="lc" value="#888888" oninput="render()"><input type="range" id="lw" min="0.5" max="4" step="0.5" value="1.5" oninput="render()"></div>
 </div>
@@ -1635,8 +1658,15 @@ function exportPNG(){
 }
 
 // ── IMPORT / EXPORT ──
+// Estado "puro" dos dados (sem timestamp), usado para export local E para o Firebase.
+// Fica estável entre chamadas quando nada mudou de fato — isso é o que permite ao
+// autosave comparar "mudou ou não mudou" sem disparar gravações desnecessárias.
+function getStateSnapshot(){
+  return {nodes,activeLinks:[...links],company,project,nodeDir,globalDir,classifications,cfg:{lc:LC(),lw:LW()}};
+}
+
 function getCurrentStateObject(){
-  return {nodes,activeLinks:[...links],company,project,nodeDir,globalDir,classifications,cfg:{lc:LC(),lw:LW()},meta:{v:5,d:new Date().toISOString()}};
+  return Object.assign({}, getStateSnapshot(), {meta:{v:5,d:new Date().toISOString()}});
 }
 
 function doExport(){
@@ -1689,27 +1719,90 @@ function doImport(e){
   r.readAsText(file,'UTF-8');
 }
 
-// ── FIREBASE: SALVAR / ABRIR VERSÕES (coleção "organograma") ──
+// ── FIREBASE: VERSÕES + AUTOSAVE + TEMPO REAL (coleção "organograma") ──
+// currentDocId = qual documento do Firestore está "aberto" agora. Enquanto ele existir:
+//  - toda edição na tela agenda uma gravação automática nele (autosave, debounced)
+//  - um listener em tempo real aplica na tela qualquer mudança feita por outra aba/pessoa
+let currentDocId=null, currentDocName=null;
+let lastSyncedStateJSON=null;   // último estado conhecido em comum com o Firestore (evita gravações/loops desnecessários)
+let unsubscribeSnapshot=null;   // função para parar de "escutar" o documento anterior ao trocar de versão
+let autosaveTimer=null;
+let suppressAutosave=false;     // true enquanto aplicamos um estado que já VEIO do Firestore
+
+function setSyncStatus(state){
+  const el=document.getElementById('sync-status');
+  if(!el) return;
+  const nm=currentDocName?esc(currentDocName):'';
+  if(state==='synced')      el.innerHTML='🟢 <b>'+nm+'</b> · sincronizado';
+  else if(state==='pending')el.innerHTML='🟡 <b>'+nm+'</b> · salvando...';
+  else if(state==='error')  el.innerHTML='🔴 <b>'+nm+'</b> · erro ao sincronizar';
+  else                      el.innerHTML='<span style="color:#999;">nenhuma revisão aberta</span>';
+}
+
+// Passa a "seguir" um documento: para de escutar o anterior e começa a escutar o novo
+function watchCurrentDoc(){
+  if(unsubscribeSnapshot){ unsubscribeSnapshot(); unsubscribeSnapshot=null; }
+  if(!currentDocId || !window.__fb) return;
+  unsubscribeSnapshot=window.__fb.watchOrganograma(currentDocId, function(data){
+    const json=JSON.stringify(data.state);
+    if(json===lastSyncedStateJSON) return; // é o eco da nossa própria gravação, ou nada mudou
+    lastSyncedStateJSON=json;
+    suppressAutosave=true;
+    try{ applyImportedState(data.state); } finally { suppressAutosave=false; }
+    setSyncStatus('synced');
+    toast('Organograma atualizado em tempo real ✓');
+  });
+}
+
+function scheduleAutosave(){
+  if(suppressAutosave) return;
+  if(!currentDocId || !window.__fb) return;
+  setSyncStatus('pending');
+  clearTimeout(autosaveTimer);
+  autosaveTimer=setTimeout(doAutosave, 1200);
+}
+
+async function doAutosave(){
+  if(!currentDocId || !window.__fb) return;
+  const state=getStateSnapshot();
+  const json=JSON.stringify(state);
+  if(json===lastSyncedStateJSON){ setSyncStatus('synced'); return; }
+  try{
+    await window.__fb.updateOrganograma(currentDocId, state);
+    lastSyncedStateJSON=json;
+    setSyncStatus('synced');
+  }catch(err){
+    console.error('Erro no autosave:', err);
+    setSyncStatus('error');
+  }
+}
+
 function openFbSave(){
   if(!nodes.length){ toast('Organograma vazio, nada para salvar.'); return; }
-  document.getElementById('fbsave-name').value='';
+  document.getElementById('fbsave-name').value=currentDocName?currentDocName:'';
   document.getElementById('fbsave-hint').textContent='';
   document.getElementById('fbsave-ov').classList.add('on');
   setTimeout(function(){ document.getElementById('fbsave-name').focus(); },50);
 }
 function closeFbSave(){ document.getElementById('fbsave-ov').classList.remove('on'); }
 
+// Cria uma NOVA revisão nomeada (novo documento). A partir daqui, essa revisão passa a
+// ser a "aberta": autosave e tempo real passam a valer para ela.
 async function confirmFbSave(){
   const nameEl=document.getElementById('fbsave-name');
   const name=nameEl.value.trim();
-  if(!name){ toast('Digite um nome para o documento.'); nameEl.focus(); return; }
+  if(!name){ toast('Digite um nome para a revisão.'); nameEl.focus(); return; }
   if(!window.__fb){ toast('Firebase ainda não carregou. Tente novamente em instantes.'); return; }
   const btn=document.getElementById('fbsave-btn');
   btn.disabled=true; btn.textContent='Salvando...';
   try{
-    await window.__fb.saveOrganograma(name, getCurrentStateObject());
+    const state=getStateSnapshot();
+    const id=await window.__fb.saveOrganograma(name, state);
+    currentDocId=id; currentDocName=name; lastSyncedStateJSON=JSON.stringify(state);
+    watchCurrentDoc();
+    setSyncStatus('synced');
     closeFbSave();
-    toast('Versão "'+name+'" salva no Firebase! ✓');
+    toast('Revisão "'+name+'" criada! Agora ela salva sozinha e em tempo real. ✓');
   }catch(err){
     console.error('Erro ao salvar no Firebase:', err);
     document.getElementById('fbsave-hint').textContent='Erro ao salvar: '+(err.message||err);
@@ -1725,11 +1818,12 @@ async function openFbOpen(){
   if(!window.__fb){ list.innerHTML='<div class="hint">Firebase ainda não carregou. Tente novamente em instantes.</div>'; return; }
   try{
     const docs=await window.__fb.listOrganogramas();
-    if(!docs.length){ list.innerHTML='<div class="hint">Nenhuma versão salva ainda.</div>'; return; }
+    if(!docs.length){ list.innerHTML='<div class="hint">Nenhuma revisão salva ainda.</div>'; return; }
     list.innerHTML=docs.map(function(d){
       const dt=d.createdAt?new Date(d.createdAt).toLocaleString('pt-BR'):'';
-      return '<div onclick="loadFbDoc(\''+d.id+'\')" style="padding:10px 12px;border:1px solid #ddd;border-radius:6px;margin-bottom:8px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:10px;" onmouseover="this.style.background=\'#f5f5f5\'" onmouseout="this.style.background=\'\'">'
-        +'<span style="font-weight:600;font-size:13px;">'+esc(d.name)+'</span>'
+      const atual=(d.id===currentDocId);
+      return '<div onclick="loadFbDoc(\''+d.id+'\')" style="padding:10px 12px;border:1px solid '+(atual?'#6aba3a':'#ddd')+';background:'+(atual?'#f0f7ea':'#fff')+';border-radius:6px;margin-bottom:8px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:10px;" onmouseover="this.style.background=\'#f5f5f5\'" onmouseout="this.style.background=\''+(atual?'#f0f7ea':'')+'\'">'
+        +'<span style="font-weight:600;font-size:13px;">'+esc(d.name)+(atual?' <span style="color:#4a9020;font-weight:400;">(aberta agora)</span>':'')+'</span>'
         +'<span style="font-size:11px;color:#888;white-space:nowrap;">'+dt+'</span>'
         +'</div>';
     }).join('');
@@ -1740,26 +1834,44 @@ async function openFbOpen(){
 }
 function closeFbOpen(){ document.getElementById('fbopen-ov').classList.remove('on'); }
 
+// Abre uma revisão existente: carrega os dados, e passa a autosalvar/sincronizar nela
 async function loadFbDoc(id){
   if(!window.__fb) return;
   try{
     const d=await window.__fb.getOrganograma(id);
-    if(!d){ toast('Documento não encontrado.'); return; }
-    applyImportedState(d.state);
+    if(!d){ toast('Revisão não encontrada.'); return; }
+    suppressAutosave=true;
+    try{ applyImportedState(d.state); } finally { suppressAutosave=false; }
+    currentDocId=d.id; currentDocName=d.name; lastSyncedStateJSON=JSON.stringify(d.state);
+    watchCurrentDoc();
+    setSyncStatus('synced');
     closeFbOpen();
-    toast('Versão "'+d.name+'" carregada! ✓');
+    toast('Revisão "'+d.name+'" aberta — salvando automaticamente a partir de agora. ✓');
   }catch(err){
     console.error('Erro ao carregar documento:', err);
-    toast('Erro ao carregar documento: '+(err.message||err));
+    toast('Erro ao carregar revisão: '+(err.message||err));
   }
 }
 
 // Wire up file inputs via addEventListener (avoids onchange same-file issues)
 document.addEventListener('DOMContentLoaded', function(){
   document.getElementById('fi').addEventListener('change', doImport);
+  setSyncStatus('idle');
 });
 
 function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('on'); setTimeout(function(){ t.classList.remove('on'); },2800); }
+
+// Toda chamada a render() no app inteiro passa a também agendar o autosave no Firebase
+// (quando houver uma revisão aberta). Isso evita ter que "avisar" manualmente cada
+// função de edição (adicionar/remover cargo, arrastar, editar texto, etc.) — todas elas
+// já chamam render() ao final, então o autosave fica coberto automaticamente.
+(function(){
+  const _origRender=render;
+  render=function(){
+    _origRender.apply(this,arguments);
+    scheduleAutosave();
+  };
+})();
 
 // ── SAVE HTML (self-contained, fully editable) ──
 function saveHTML(){
