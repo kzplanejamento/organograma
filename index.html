@@ -67,6 +67,11 @@
     });
   }
 
+  // Renomeia uma revisão já salva (só o nome, não mexe no conteúdo)
+  async function renameOrganograma(id, newName){
+    await updateDoc(doc(db, COLLECTION_NAME, id), { name: newName });
+  }
+
   // Tempo real: escuta mudanças no documento (feitas por outra pessoa/aba) e chama cb(data)
   // Ignora o próprio "eco" da escrita local (hasPendingWrites) para não entrar em loop.
   function watchOrganograma(id, cb){
@@ -81,7 +86,7 @@
   }
 
   // Expõe as funções para o script principal (não-module) usar
-  window.__fb = { saveOrganograma, listOrganogramas, getOrganograma, updateOrganograma, watchOrganograma };
+  window.__fb = { saveOrganograma, listOrganogramas, getOrganograma, updateOrganograma, watchOrganograma, renameOrganograma };
 </script>
 
 <style>
@@ -363,6 +368,22 @@ body { font-family: Arial, sans-serif; background: #e8e8e8; color: #333; }
     <div id="fbopen-list" style="max-height:50vh;overflow-y:auto;"></div>
     <div style="display:flex;justify-content:flex-end;margin-top:10px;">
       <button class="tb" onclick="closeFbOpen()">Fechar</button>
+    </div>
+  </div>
+</div>
+
+<!-- FIREBASE: RENOMEAR REVISÃO -->
+<div class="modal-bg" id="fbrename-ov">
+  <div class="modal-box">
+    <h2>✏ Renomear revisão</h2>
+    <div class="mf">
+      <label>Novo nome</label>
+      <input id="fbrename-name" placeholder="Ex: Rev.03 - Agosto/2026" onkeydown="if(event.key==='Enter')confirmFbRename();">
+    </div>
+    <div class="hint" id="fbrename-hint" style="margin-bottom:8px;"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:6px;">
+      <button class="tb" onclick="closeFbRename()">Cancelar</button>
+      <button class="tb g" id="fbrename-btn" onclick="confirmFbRename()">Salvar</button>
     </div>
   </div>
 </div>
@@ -1177,9 +1198,17 @@ function loadLogo(e){
 document.getElementById('co-ov').addEventListener('click',e=>{ if(e.target===document.getElementById('co-ov')) closeCompany(); });
 
 // ── PROJECT ──
+// Data de hoje no formato do <input type="date"> (YYYY-MM-DD), sempre no horário LOCAL
+// (evita o bug clássico de usar toISOString(), que converte para UTC e pode voltar/adiantar um dia).
+function todayISO(){
+  const d=new Date();
+  return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+}
+
 function openProject(){
   ['co-name','cl-name','obra','contrato','resp','rev'].forEach(k=>{ document.getElementById('pj-'+k).value=project[k.replace('-','')]||''; });
-  document.getElementById('pj-data').value=project.data||'';
+  // Se a data ainda não foi preenchida, já sugere a data de hoje (o usuário pode trocar se quiser)
+  document.getElementById('pj-data').value=project.data||todayISO();
   const cprev=document.getElementById('pj-co-logo-prev');
   if(project.coLogo){cprev.src=project.coLogo;cprev.style.display='';document.getElementById('pj-co-logo-rm').style.display='';}
   else{cprev.style.display='none';document.getElementById('pj-co-logo-rm').style.display='none';}
@@ -1589,7 +1618,9 @@ function doPDF(){
       // Detail row
       const fields=[];
       if(project.contrato) fields.push(['Contrato',project.contrato]);
-      if(project.data) fields.push(['Data',project.data.split('-').reverse().join('/')]);
+      // Se por algum motivo a data do projeto não foi definida, usa a data de hoje como respaldo
+      const dataParaExibir = project.data || todayISO();
+      fields.push(['Data',dataParaExibir.split('-').reverse().join('/')]);
       if(project.resp) fields.push(['Responsável',project.resp]);
       if(project.rev) fields.push(['Revisão',project.rev]);
       if(fields.length){
@@ -1832,6 +1863,8 @@ async function confirmFbSave(){
   }
 }
 
+let lastFbDocsList=[]; // cache da última lista carregada, usado para achar o nome atual ao renomear
+
 async function openFbOpen(){
   document.getElementById('fbopen-ov').classList.add('on');
   const list=document.getElementById('fbopen-list');
@@ -1839,13 +1872,17 @@ async function openFbOpen(){
   if(!window.__fb){ list.innerHTML='<div class="hint">Firebase ainda não carregou. Tente novamente em instantes.</div>'; return; }
   try{
     const docs=await window.__fb.listOrganogramas();
+    lastFbDocsList=docs;
     if(!docs.length){ list.innerHTML='<div class="hint">Nenhuma revisão salva ainda.</div>'; return; }
     list.innerHTML=docs.map(function(d){
       const dt=d.createdAt?new Date(d.createdAt).toLocaleString('pt-BR'):'';
       const atual=(d.id===currentDocId);
-      return '<div onclick="loadFbDoc(\''+d.id+'\')" style="padding:10px 12px;border:1px solid '+(atual?'#6aba3a':'#ddd')+';background:'+(atual?'#f0f7ea':'#fff')+';border-radius:6px;margin-bottom:8px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:10px;" onmouseover="this.style.background=\'#f5f5f5\'" onmouseout="this.style.background=\''+(atual?'#f0f7ea':'')+'\'">'
-        +'<span style="font-weight:600;font-size:13px;">'+esc(d.name)+(atual?' <span style="color:#4a9020;font-weight:400;">(aberta agora)</span>':'')+'</span>'
+      return '<div style="padding:6px 6px 6px 12px;border:1px solid '+(atual?'#6aba3a':'#ddd')+';background:'+(atual?'#f0f7ea':'#fff')+';border-radius:6px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;gap:6px;">'
+        +'<div onclick="loadFbDoc(\''+d.id+'\')" style="flex:1;min-width:0;cursor:pointer;padding:4px 0;">'
+        +'<span style="font-weight:600;font-size:13px;">'+esc(d.name)+(atual?' <span style="color:#4a9020;font-weight:400;">(aberta agora)</span>':'')+'</span><br>'
         +'<span style="font-size:11px;color:#888;white-space:nowrap;">'+dt+'</span>'
+        +'</div>'
+        +'<button onclick="event.stopPropagation();openFbRenameById(\''+d.id+'\')" title="Renomear esta revisão" style="background:none;border:1px solid #ddd;border-radius:5px;cursor:pointer;font-size:13px;padding:5px 8px;color:#555;">✏</button>'
         +'</div>';
     }).join('');
   }catch(err){
@@ -1854,6 +1891,43 @@ async function openFbOpen(){
   }
 }
 function closeFbOpen(){ document.getElementById('fbopen-ov').classList.remove('on'); }
+
+// ── Renomear revisão salva (só o nome, mantém o conteúdo) ──
+let renameTargetId=null;
+function openFbRenameById(id){
+  const d=lastFbDocsList.find(function(x){ return x.id===id; });
+  openFbRename(id, d?d.name:'');
+}
+function openFbRename(id, currentName){
+  renameTargetId=id;
+  document.getElementById('fbrename-name').value=currentName||'';
+  document.getElementById('fbrename-hint').textContent='';
+  document.getElementById('fbrename-ov').classList.add('on');
+  setTimeout(function(){ document.getElementById('fbrename-name').focus(); document.getElementById('fbrename-name').select(); },50);
+}
+function closeFbRename(){ document.getElementById('fbrename-ov').classList.remove('on'); renameTargetId=null; }
+
+async function confirmFbRename(){
+  const nameEl=document.getElementById('fbrename-name');
+  const name=nameEl.value.trim();
+  if(!name){ toast('Digite um nome.'); nameEl.focus(); return; }
+  if(!window.__fb||!renameTargetId) return;
+  const btn=document.getElementById('fbrename-btn');
+  btn.disabled=true; btn.textContent='Salvando...';
+  try{
+    await window.__fb.renameOrganograma(renameTargetId, name);
+    if(renameTargetId===currentDocId){ currentDocName=name; setSyncStatus('synced'); }
+    const id=renameTargetId;
+    closeFbRename();
+    toast('Revisão renomeada! ✓');
+    if(document.getElementById('fbopen-ov').classList.contains('on')) openFbOpen(); // atualiza a lista aberta
+  }catch(err){
+    console.error('Erro ao renomear revisão:', err);
+    document.getElementById('fbrename-hint').textContent='Erro ao renomear: '+(err.message||err);
+  }finally{
+    btn.disabled=false; btn.textContent='Salvar';
+  }
+}
 
 // Abre uma revisão existente: carrega os dados, e passa a autosalvar/sincronizar nela
 async function loadFbDoc(id){
